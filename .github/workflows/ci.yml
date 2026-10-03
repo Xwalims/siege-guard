@@ -25,11 +25,30 @@ jobs:
       - name: Run the attack demonstration
         run: node examples/attack-demo.js
       - name: The CLI must report a denial
+        # GitHub Actions runs every `run:` block under `bash -e`, so a command
+        # that exits non-zero aborts the step before the next line runs. The
+        # capture has to be in the same statement as the command, or `simulate`
+        # exiting 1 would kill the step and never be compared against anything.
         run: |
-          node bin/siege-guard.js simulate
-          code=$?
+          code=0
+          node bin/siege-guard.js simulate || code=$?
+          echo "simulate exited with $code"
           if [ "$code" -ne 1 ]; then
             echo "expected exit 1 from simulate, got $code"
+            exit 1
+          fi
+      - name: Usage errors must exit 2
+        run: |
+          code=0
+          node bin/siege-guard.js bogus || code=$?
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit 2 from an unknown command, got $code"
+            exit 1
+          fi
+          code=0
+          node bin/siege-guard.js inspect --nonsense || code=$?
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit 2 from an unknown option, got $code"
             exit 1
           fi
 
