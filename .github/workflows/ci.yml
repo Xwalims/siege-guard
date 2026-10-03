@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No install step: the package has no dependencies, so there is nothing
+      # to fetch and nothing to audit.
+      - name: Run the test suite
+        run: node --test
+      - name: Run the attack demonstration
+        run: node examples/attack-demo.js
+      - name: The CLI must report a denial
+        run: |
+          node bin/siege-guard.js simulate
+          code=$?
+          if [ "$code" -ne 1 ]; then
+            echo "expected exit 1 from simulate, got $code"
+            exit 1
+          fi
+
+  cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The IPv6 masking is checked against Python's ipaddress module rather
+      # than against this repository's own expectations, because those
+      # expectations were wrong twice while writing the tests.
+      - name: Compare prefix handling with Python
+        run: python3 scripts/cross-check.py

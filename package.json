@@ -1,0 +1,33 @@
+{
+  "name": "siege-guard",
+  "version": "0.1.0",
+  "description": "Adaptive application-layer DoS defence: cost-weighted sliding window, IPv6-aware identity, path-entropy scan detection, circuit breaker. Zero dependencies.",
+  "main": "src/index.js",
+  "bin": {
+    "siege-guard": "bin/siege-guard.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "cross-check": "python3 scripts/cross-check.py",
+    "demo": "node examples/attack-demo.js",
+    "simulate": "node bin/siege-guard.js simulate"
+  },
+  "keywords": [
+    "ddos",
+    "rate-limit",
+    "security",
+    "ipv6",
+    "circuit-breaker",
+    "middleware"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
