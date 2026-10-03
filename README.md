@@ -337,6 +337,14 @@ processes in that gap each see room for one more request. `RedisStore` therefore
 script that trims the window and tests the budget in one server-side operation. A pipeline of
 `ZREMRANGEBYSCORE` → `ZCARD` → `ZADD` is not equivalent, and that mistake is common.
 
+**The member encoding matters.** A stored entry is `cost|now|id`, cost first, because
+both readers take a *leading* number: the Lua script with `string.match(m, '^([%d%.]+)')`
+and `peek()` through `RedisStore.costOf`. An earlier encoding put the timestamp first and
+the cost last, where the non-greedy match stopped at the wrong colon, `tonumber` returned
+nil, and the script's `used` stayed 0 — a store that admits every request while looking
+correct. `test/redis-store.test.js` runs the script's own extraction rule over members built
+by the script's own writer instead of trusting a regex over the source.
+
 A shared store also gives a place to put global state this package does not implement:
 per-identity strikes and blocked-until timestamps are still per-process, so with N instances
 a client needs N strikes before any one of them blocks it. Pass the same store for counters
@@ -572,8 +580,8 @@ $ npm test
 ```
 
 ```
-ℹ tests 215
-ℹ pass 215
+ℹ tests 225
+ℹ pass 225
 ℹ fail 0
 ```
 
