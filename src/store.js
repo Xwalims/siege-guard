@@ -124,6 +124,23 @@ class InMemoryStore {
  * time. The window is trimmed by score, and the total is the sum of a `cost`
  * field carried in the member's metadata.
  *
+ * ## The member encoding, which is easy to get subtly wrong
+ *
+ * A member is `<cost>|<now>|<random>`: the cost leads and is closed by a pipe,
+ * because both readers match a leading number terminated by that delimiter --
+ * Lua with `string.match(rows[i], '^([%d%.]+)|')` and {@link RedisStore#costOf}
+ * with `/^([\d.]+)\|/`.
+ *
+ * An earlier encoding put the cost last (`<now>-<cost>-<random>:<cost>`), where
+ * the non-greedy pattern stopped at the wrong colon and made `tonumber` return
+ * nil, breaking the script's arithmetic outright. Merely moving the cost to the
+ * front is not enough either: a bare leading-number match then reads a *legacy*
+ * member's arrival timestamp as its cost, reporting 1.75e12 of spend and locking
+ * the identity out for a full window. The pipe is what makes an unreadable
+ * member read as zero. See test/redis-store.test.js, which runs a real round
+ * trip -- the script's own writer against the script's own reader, both parsed
+ * out of SPEND_SCRIPT rather than hand-copied.
+ *
  * @param {object} options
  * @param {object} options.client a redis client exposing eval/evalSha/zremrangebyscore/zrange/zadd/del/keys
  * @param {string} [options.prefix='sgw'] key namespace
@@ -145,6 +162,41 @@ class RedisStore {
   }
 
   /**
+   * Build a sorted-set member in the exact shape the Lua script writes.
+   *
+   * Cost first, then arrival time, then a uniquifier. Anything that reads a
+   * stored member must go through here and through the extraction rule the
+   * script uses, or it will read the wrong field.
+   *
+   * @param {number} cost
+   * @param {number} now
+   * @param {string} [unique]
+   * @returns {string}
+   */
+  static member(cost, now, unique) {
+    const tail = unique ?? Math.random().toString(36).slice(2, 10);
+    return `${cost}|${now}|${tail}`;
+  }
+
+  /**
+   * The leading-number-plus-pipe rule shared with the Lua script's
+   * `string.match(m, '^([%d%.]+)|')`. Kept in one place so the two cannot drift
+   * apart.
+   *
+   * The trailing pipe is load-bearing. A member from an older encoding led with
+   * the arrival time, so matching a bare leading number reads 1.75e12 as a cost.
+   * Requiring the delimiter means such a member reads as 0 -- fail open, and the
+   * key ages out of the window normally -- rather than bricking an identity.
+   *
+   * @param {string} member
+   * @returns {number} the cost, or 0 for a member this version cannot read
+   */
+  static costOf(member) {
+    const m = /^([\d.]+)\|/.exec(member);
+    return m ? Number(m[1]) : 0;
+  }
+
+  /**
    * Atomically trim the window, test the budget, and record the request.
    *
    * Returned as a string rather than executed, so this package needs no Redis
@@ -155,6 +207,13 @@ class RedisStore {
 -- KEYS[1] the window key
 -- ARGV[1] windowMs  ARGV[2] limit  ARGV[3] cost  ARGV[4] now  ARGV[5] memberId
 --                                     ARGV[6] maxSamples
+--
+-- A stored member is "<cost>|<now>|<memberId>". The cost leads *and* is
+-- terminated by a pipe on purpose. Both readers match '^([%d%.]+)|': anchoring
+-- only the start is not enough, because an older encoding led with the arrival
+-- time, so a bare leading-number match reads 1.75e12 as a cost and locks the
+-- identity out for a whole window. Requiring the pipe makes an unreadable
+-- member read as no spend at all, which fails open instead of bricking a key.
 local key      = KEYS[1]
 local window   = tonumber(ARGV[1])
 local limit    = tonumber(ARGV[2])
@@ -168,7 +227,8 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
 local rows = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
 local used = 0
 for i = 1, #rows, 2 do
-  used = used + tonumber(string.match(rows[i], '^(.-):') or '0')
+  local c = string.match(rows[i], '^([%d%.]+)|')
+  if c then used = used + tonumber(c) end
 end
 
 if used + cost > limit then
@@ -179,7 +239,7 @@ if used + cost > limit then
   return {0, tostring(used), tostring(retry)}
 end
 
-redis.call('ZADD', key, now, member .. ':' .. cost)
+redis.call('ZADD', key, now, tostring(cost) .. '|' .. now .. '|' .. member)
 redis.call('ZCARD', key)
 local count = redis.call('ZCARD', key)
 if count > maxSamp then
@@ -191,7 +251,10 @@ return {1, tostring(used + cost), '0'}
 
   /** @inheritdoc */
   async spend(key, cost, windowMs, limit, now) {
-    const memberId = `${now}-${cost}-${Math.random().toString(36).slice(2, 10)}`;
+    // Only a uniquifier: the script prepends cost and now itself, so a memberId
+    // carrying its own copy of either would put a third number in front of the
+    // cost and the leading-number readers would total the wrong thing.
+    const memberId = Math.random().toString(36).slice(2, 10);
     const raw = await this.client.eval(this.SPEND_SCRIPT, {
       keys: [this.keyFor(key)],
       arguments: [String(windowMs), String(limit), String(cost), String(now), memberId, String(this.maxSamples)],
@@ -213,8 +276,7 @@ return {1, tostring(used + cost), '0'}
     for (let i = 0; i < rows.length; i += 2) {
       const score = Number(rows[i + 1]);
       if (score <= cutoff) continue;
-      const prefix = /^(\d+(?:\.\d+)?)/.exec(rows[i]);
-      used += prefix ? Number(prefix[1]) : 0;
+      used += RedisStore.costOf(rows[i]);
     }
     return { used, backend: 'redis' };
   }
