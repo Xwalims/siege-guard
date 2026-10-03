@@ -176,3 +176,65 @@ test('the entropy of a long uniform trace never exceeds log2 of its length', () 
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Static assets must not look like an enumeration
+// ---------------------------------------------------------------------------
+
+test('hashed static asset names are not treated as a scan', () => {
+  // A bundler or CDN emits /assets/app.<hash>.js, so a single-page app produces
+  // hundreds of distinct paths. Flagging that as enumeration challenges ordinary
+  // users, which is how a limiter gets switched off.
+  const tracker = new PathEntropyTracker();
+  const trace = Array.from({ length: 60 }, (_, i) =>
+    `/assets/chunk.${i.toString(16).padStart(8, '0')}.js`
+  );
+  let verdict;
+  for (const p of trace) verdict = tracker.observe('c', p);
+  assert.equal(verdict.isScan, false, `legitimate asset loading flagged: ${verdict.reason}`);
+  assert.equal(verdict.ignored, true);
+  assert.equal(verdict.samples, 0, 'ignored paths must not enter the sample');
+});
+
+test('a real scanner reaching for non-static paths is still caught', () => {
+  // The ignore list must not become a blind spot: these are the paths an
+  // enumerator actually wants.
+  const tracker = new PathEntropyTracker();
+  const trace = [
+    '/.env', '/wp-login.php', '/api/admin', '/api/users', '/backup.sql',
+    '/.git/HEAD', '/phpmyadmin', '/config.php', '/id_rsa', '/.htaccess',
+    '/server-status', '/api/debug', '/.aws/credentials', '/proc/self/environ',
+    '/wp-config.php', '/admin/login',
+  ];
+  let verdict;
+  for (const p of trace) verdict = tracker.observe('c', p);
+  assert.equal(verdict.isScan, true, `an enumerator passed: ${verdict.reason}`);
+});
+
+test('a mixed trace of assets and one real probe stays below the threshold', () => {
+  const tracker = new PathEntropyTracker();
+  const trace = [
+    '/app.css', '/app.js', '/logo.png', '/a1.woff2', '/b2.woff2',
+    '/app.css', '/app.js', '/logo.png', '/.env',
+  ];
+  let verdict;
+  for (const p of trace) verdict = tracker.observe('c', p);
+  assert.equal(verdict.isScan, false, `one probe among assets flagged: ${verdict.reason}`);
+});
+
+test('an operator can supply their own ignore patterns', () => {
+  const tracker = new PathEntropyTracker({
+    ignorePatterns: [/^\/health/, /\.js$/],
+  });
+  for (const p of ['/health/live', '/health/ready', '/a.js', '/b.js']) {
+    assert.equal(tracker.observe('c', p).ignored, true, `${p} should be ignored`);
+  }
+  const probe = tracker.observe('c', '/api/admin');
+  assert.notEqual(probe.ignored, true, 'a path outside the patterns must be tracked');
+});
+
+test('a string pattern is accepted as well as a RegExp', () => {
+  const tracker = new PathEntropyTracker({ ignorePatterns: ['^/internal/'] });
+  assert.equal(tracker.observe('c', '/internal/debug').ignored, true);
+  assert.notEqual(tracker.observe('c', '/api/x').ignored, true);
+});

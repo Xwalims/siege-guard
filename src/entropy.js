@@ -47,6 +47,15 @@ const SCAN_NOVELTY = 0.6;
 const DEFAULT_HISTORY = 64;
 
 /**
+ * Paths treated as static and therefore excluded from scan detection.
+ *
+ * A webpack or esbuild output is `/assets/app.4f2a91.js`: every build changes the
+ * name, so a client walking a single-page app touches hundreds of distinct paths.
+ * Treating that as enumeration challenges ordinary users.
+ */
+const DEFAULT_IGNORE_PATTERN = /\.(?:css|js|mjs|map|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|mp4|webm|pdf|txt|xml)$/i;
+
+/**
  * Shannon entropy of a count distribution, in bits per observation.
  *
  * @param {Iterable<number>} counts non-negative frequencies
@@ -81,6 +90,13 @@ class PathEntropyTracker {
     this.minSamples = options.minSamples ?? MIN_SAMPLES;
     this.scanEntropy = options.scanEntropy ?? SCAN_ENTROPY;
     this.scanNovelty = options.scanNovelty ?? SCAN_NOVELTY;
+    /**
+     * Paths excluded from the entropy computation. Defaults to static assets,
+     * because hashed filenames from a bundler or CDN are unique by construction.
+     */
+    this.ignorePatterns = options.ignorePatterns
+      ? options.ignorePatterns.map((p) => (p instanceof RegExp ? p : new RegExp(p)))
+      : [DEFAULT_IGNORE_PATTERN];
     /** @type {Map<string, {order: string[], seen: Set<string>, requests: number, novel: number}>} */
     this.state = new Map();
   }
@@ -88,12 +104,31 @@ class PathEntropyTracker {
   /**
    * Record a path request.
    *
+   * Static assets are counted, not sampled. A CDN serving 400 hashed chunk names
+   * produces a stream of unique paths that is indistinguishable from a directory
+   * enumeration -- and a rule that challenges every such client is a rule that
+   * punishes legitimate traffic, which is the mistake that gets a limiter
+   * switched off. An operator can exclude their own patterns with
+   * `ignorePatterns`.
+   *
    * @param {string} key rate-limit identity
    * @param {string} path the requested path, query string excluded
    * @returns {{samples: number, entropy: number, novelty: number,
    *            isScan: boolean, reason: string}}
    */
   observe(key, path) {
+    for (const pattern of this.ignorePatterns) {
+      if (pattern.test(path)) {
+        return {
+          samples: this.state.has(key) ? this.state.get(key).order.length : 0,
+          entropy: 0,
+          novelty: 0,
+          isScan: false,
+          reason: 'path matches an ignored pattern',
+          ignored: true,
+        };
+      }
+    }
     let entry = this.state.get(key);
     if (!entry) {
       entry = { order: [], seen: new Set(), requests: 0, novel: 0 };
@@ -199,4 +234,5 @@ module.exports = Object.freeze({
   SCAN_ENTROPY,
   SCAN_NOVELTY,
   DEFAULT_HISTORY,
+  DEFAULT_IGNORE_PATTERN,
 });
