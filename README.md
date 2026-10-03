@@ -397,8 +397,8 @@ $ npm test
 ```
 
 ```
-ℹ tests 116
-ℹ pass 116
+ℹ tests 144
+ℹ pass 144
 ℹ fail 0
 ```
 
