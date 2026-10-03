@@ -144,8 +144,32 @@ function syntheticAttack(guard, startAt) {
   }
 
   // 2. A scanner enumerating paths, with no browser-shaped headers at all.
+  //    It is served and charged a surcharge, not banned: a fingerprint alone is
+  //    not evidence, and pretending otherwise would be the bug this package had.
   for (const path of ['/.env', '/wp-login.php', '/api/admin', '/api/users', '/.git/HEAD']) {
     hit('scanner', scanner(path, '198.51.100.23'));
+  }
+
+  // 2b. The same scanner that forges every header this package checks. It gets
+  //     a fingerprint of 0.00 and is indistinguishable from Chrome, which is
+  //     exactly why a fingerprint may not convict.
+  const forged = (url, address) => ({
+    method: 'GET', url, httpVersion: '1.1',
+    socket: { remoteAddress: address },
+    headers: {
+      Host: 'oakwall.net',
+      'User-Agent':
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none', 'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1', Connection: 'keep-alive',
+    },
+  });
+  for (const path of ['/.env', '/.git/config', '/wp-config.php.bak']) {
+    hit('forged-scanner', forged(path, '198.51.100.77'));
   }
 
   // 3. An L7 flood from one host: many cheap requests, then a burst of writes.
@@ -210,10 +234,12 @@ function renderSimulation(steps, report) {
   lines.push('---------------------');
   const bySource = new Map();
   for (const step of steps) {
-    const row = bySource.get(step.label) || { total: 0, allow: 0, throttle: 0, block: 0 };
+    const row = bySource.get(step.label) ||
+      { total: 0, allow: 0, throttle: 0, challenge: 0, block: 0 };
     row.total += 1;
     if (step.action === ALLOW) row.allow += 1;
     else if (step.action === THROTTLE) row.throttle += 1;
+    else if (step.action === CHALLENGE) row.challenge += 1;
     else row.block += 1;
     bySource.set(step.label, row);
   }
@@ -221,7 +247,7 @@ function renderSimulation(steps, report) {
     lines.push(
       `  ${label.padEnd(21)} ${String(row.total).padStart(4)} requests  ` +
         `${String(row.allow).padStart(4)} allowed  ${String(row.throttle).padStart(4)} throttled  ` +
-        `${String(row.block).padStart(4)} blocked`
+        `${String(row.challenge).padStart(4)} challenged  ${String(row.block).padStart(4)} blocked`
     );
   }
   return lines.join('\n');
@@ -236,7 +262,14 @@ function renderSimulation(steps, report) {
  */
 function commandSimulate(options, io) {
   let now = 1_700_000_000_000;
-  const guard = new SiegeGuard({ ...options, now: () => now });
+  // A challenge hook is wired on purpose: it is what suspicion earns now that
+  // it can no longer earn a ban. Without it the run would show fingerprints
+  // doing nothing at all, which is not what this package does.
+  const guard = new SiegeGuard({
+    ...options,
+    challenge: () => 'prove you are a browser',
+    now: () => now,
+  });
   const steps = syntheticAttack(guard, now);
   const report = guard.report();
 

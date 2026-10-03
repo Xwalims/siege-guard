@@ -24,6 +24,60 @@ jobs:
         run: node --test
       - name: Run the attack demonstration
         run: node examples/attack-demo.js
+      # These three are the invariants this package exists to hold. Each one was
+      # a real bug, so each gets a check that fails loudly if it comes back.
+      - name: A fingerprint must never convict
+        run: |
+          code=0
+          node -e "
+            const { judge } = require('./src/policy.js');
+            const worst = { score: 1, signals: {}, keys: [], reason: 'forged' };
+            const v = judge({ fingerprint: worst,
+              entropy: { isScan: false, samples: 0, entropy: 0, novelty: 0 },
+              budget: { used: 0, limit: 1000 }, cost: 5, strikes: 0,
+              options: { limit: 1000 } });
+            if (v.blockBases.length) { console.error(v.blockBases); process.exit(1); }
+          " || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "a forgeable signal produced a block basis"
+            exit 1
+          fi
+      - name: A forged X-Forwarded-For must be discarded
+        run: |
+          code=0
+          node -e "
+            const { createAddressResolver } = require('./src/proxy.js');
+            const r = createAddressResolver({ trustedProxies: ['127.0.0.1'], trustLoopback: false });
+            const v = r.resolve({ socket: { remoteAddress: '127.0.0.1' },
+              headers: { 'x-forwarded-for': '1.2.3.4, 203.0.113.7' } });
+            if (v.address !== '203.0.113.7') {
+              console.error('forged address was trusted:', v.address);
+              process.exit(1);
+            }
+          " || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "proxy address resolution is not discarding forged entries"
+            exit 1
+          fi
+      - name: A shared store must not multiply the budget
+        run: |
+          code=0
+          node -e "
+            const { InMemoryStore } = require('./src/store.js');
+            const shared = new InMemoryStore();
+            let allowed = 0;
+            for (let i = 0; i < 400; i += 1) {
+              if (shared.spend('k', 5, 60000, 100, 1000000).allowed) allowed += 1;
+            }
+            if (allowed !== 20) {
+              console.error('expected 20 of 400, got', allowed);
+              process.exit(1);
+            }
+          " || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "the shared store is not enforcing a single budget"
+            exit 1
+          fi
       - name: The CLI must report a denial
         # GitHub Actions runs every `run:` block under `bash -e`, so a command
         # that exits non-zero aborts the step before the next line runs. The

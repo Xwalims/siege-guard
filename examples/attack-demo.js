@@ -59,6 +59,30 @@ function scanner(url, address) {
   };
 }
 
+/** A request with every checked header forged to look exactly like Chrome. */
+function forgedBrowser(url, address) {
+  return {
+    method: 'GET',
+    url,
+    httpVersion: '1.1',
+    socket: { remoteAddress: address },
+    headers: {
+      Host: 'oakwall.net',
+      'User-Agent':
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      Connection: 'keep-alive',
+    },
+  };
+}
+
 /** Print one section header. */
 function heading(text) {
   console.log(`\n${text}`);
@@ -81,7 +105,10 @@ function tally(rows, label, note) {
 
 function main() {
   let now = START;
-  const guard = new SiegeGuard({ now: () => now });
+  const guard = new SiegeGuard({
+    now: () => now,
+    challenge: () => 'prove you are a browser',
+  });
   const log = [];
 
   const hit = (label, req, gap = 40) => {
@@ -114,13 +141,29 @@ function main() {
   );
 
   // --------------------------------------------------------------- 2. scanner
-  heading('2. A directory scanner');
+  heading('2. A directory scanner, and the same scanner that forges every header');
   const scanned = [];
   for (const path of ['/.env', '/wp-login.php', '/api/admin', '/api/users', '/.git/HEAD']) {
-    scanned.push(hit('scanner', scanner(path, '198.51.100.23')));
+    scanned.push(hit('bare scanner', scanner(path, '198.51.100.23')));
   }
-  tally(scanned, 'scanner', 'refused by fingerprint, budget never touched');
-  console.log(`\n  ${renderDecision(scanned[0]).split('\n')[1].trim()}`);
+  tally(scanned, 'bare scanner', 'no user agent, no accept headers: fingerprint 0.77');
+
+  const forgedScanned = [];
+  for (const path of ['/.env', '/.git/config', '/wp-config.php.bak', '/id_rsa']) {
+    forgedScanned.push(hit('forged scanner', forgedBrowser(path, '198.51.100.77')));
+  }
+  tally(
+    forgedScanned,
+    'forged scanner',
+    'every header this package checks, set to exactly what Chrome sends'
+  );
+
+  const forgedPrint = guard.inspect(forgedBrowser('/.env', '198.51.100.77')).fingerprint;
+  console.log(`\n  the forged request scores ${forgedPrint.score.toFixed(2)}, exactly like Chrome.`);
+  console.log('  It is served, because a fingerprint a client can mint with six headers is');
+  console.log('  not evidence. The first version of this package banned it, which meant');
+  console.log('  anyone who read the README could earn a permanent 403.');
+  console.log(`\n  what the bare scanner gets instead: ${renderDecision(scanned[0]).split('\n')[1].trim()}`);
 
   // ----------------------------------------------------------- 3. plain flood
   heading('3. An L7 flood from one host');
@@ -177,7 +220,8 @@ function main() {
     `${report.throttled} throttled, ${report.challenged} challenged, ${report.blocked} blocked`);
   console.log(`  circuit ${report.circuit.state}, ${report.window.keys} identities tracked`);
   console.log('\n  what stopped what:');
-  console.log('    scanner              fingerprint score, before the budget is touched');
+  console.log('    bare scanner         fingerprint 0.77 earns a challenge and a 2x surcharge');
+  console.log('    forged scanner       fingerprint 0.00, indistinguishable from Chrome, served');
   console.log('    static flood         400 cheap requests fit a 1000 budget');
   console.log('    write flood          the same 1000 budget admits only 20 writes');
   console.log('    IPv6 rotation        one /64, one budget, 300 addresses or 300 clients');
@@ -185,6 +229,11 @@ function main() {
   console.log('\n  what it does not stop:');
   console.log('    a volumetric L3/L4 flood. 300 Gbit/s of UDP does not reach this code;');
   console.log('    it is absorbed upstream by a scrubbing provider or anycast.');
+  console.log('    a distributed attacker rotating prefixes, VPS and proxies. Each');
+  console.log('    allocation is a separate identity; catching that needs aggregation');
+  console.log('    above this layer.');
+  console.log('    a multi-instance deployment without a shared store. Four processes');
+  console.log('    means four budgets; pass {store} and the budget becomes global.');
 
   console.log('\n  Now the same guard in front of a real http server:');
   console.log("    const server = http.createServer(attach(handler, { guard }));");

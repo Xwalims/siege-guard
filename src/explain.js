@@ -27,6 +27,9 @@ function renderDecision(decision) {
   const who = identity.normalized || identity.raw || 'unknown';
   lines.push(`${String(d.action).toUpperCase()}  ${who}${d.status ? `  (${d.status})` : ''}`);
   lines.push(`  why      ${d.reason === undefined ? 'no reason recorded' : d.reason}`);
+  if (Array.isArray(d.bases) && d.bases.length > 0) {
+    lines.push(`  basis    ${d.bases.join(' + ')}`);
+  }
 
   const used = d.budget || (d.details && d.details.budget);
   if (used) {

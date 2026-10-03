@@ -223,7 +223,7 @@ test('the simulation covers every kind of hostile traffic', () => {
   }
 });
 
-test('the simulation refuses a scanner without touching the budget', () => {
+test('a scanner with forged headers is served, because a fingerprint is not evidence', () => {
   let now = 1_700_000_000_000;
   const { SiegeGuard } = require('../src/index.js');
   const guard = new SiegeGuard({ now: () => now });
@@ -231,10 +231,34 @@ test('the simulation refuses a scanner without touching the budget', () => {
   const scannerSteps = steps.filter((s) => s.label === 'scanner');
   assert.ok(scannerSteps.length > 0);
   assert.ok(
-    scannerSteps.every((s) => s.action === 'block'),
-    'every scanner request must be blocked'
+    scannerSteps.every((s) => s.action !== 'block'),
+    'a forged fingerprint must not ban anybody'
   );
-  assert.match(scannerSteps[0].reason, /fingerprint/);
+  // It is still priced as suspicious, which is where the defence actually is.
+  assert.ok(
+    scannerSteps.every((s) => s.action === 'allow'),
+    'the scanner is served, having paid the surcharge'
+  );
+});
+
+test('the scanner pays more than an honest client for the same request', () => {
+  let now = 1_700_000_000_000;
+  const { SiegeGuard } = require('../src/index.js');
+  const honest = new SiegeGuard({ now: () => now });
+  const hostile = new SiegeGuard({ now: () => now });
+  const clean = {
+    'User-Agent': 'Mozilla/5.0 Chrome/128.0 Safari/537.36',
+    Accept: 'text/html',
+    'Accept-Language': 'ru;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Sec-Fetch-Mode': 'navigate',
+    Host: 'oakwall.net',
+  };
+  honest.check({ method: 'GET', url: '/', httpVersion: '1.1', socket: { remoteAddress: '203.0.113.7' }, headers: clean });
+  hostile.check({ method: 'GET', url: '/', httpVersion: '1.1', socket: { remoteAddress: '198.51.100.23' }, headers: { Host: 'oakwall.net' } });
+  const a = honest.window.used('203.0.113.7');
+  const b = hostile.window.used('198.51.100.23');
+  assert.ok(b > a, `hostile client paid ${b}, honest paid ${a}`);
 });
 
 test('the IPv6 rotation stops even though every address is new', () => {
@@ -246,7 +270,17 @@ test('the IPv6 rotation stops even though every address is new', () => {
   assert.equal(rotated.length, 300);
   const allowed = rotated.filter((s) => s.action === 'allow').length;
   assert.ok(allowed < 300, `a rotating flood must be stopped, but ${allowed} of 300 passed`);
-  assert.equal(guard.window.keys.size <= 4, true, '300 addresses must not become 300 budgets');
+  // The point of the whole module: 300 distinct source addresses must collapse
+  // into ONE budget key. The simulation has six distinct sources in total, so
+  // the /64 is one of six keys rather than 300 of 300.
+  assert.ok(
+    guard.window.keys.has('2001:db8::'),
+    'the whole rotated /64 must share one identity'
+  );
+  assert.ok(
+    guard.window.keys.size < 10,
+    `300 addresses must not become 300 budgets, got ${guard.window.keys.size} keys`
+  );
 });
 
 test('the honest visitor is never disturbed', () => {

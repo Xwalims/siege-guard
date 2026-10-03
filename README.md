@@ -1,10 +1,16 @@
 # siege-guard
 
 Adaptive **application-layer (L7) DoS defence** for Node HTTP servers. Sliding-window
-cost-weighted rate limiting, IPv6-aware client identity, path-entropy scanner detection
-and a circuit breaker for a failing origin.
+cost-weighted rate limiting, IPv6-aware client identity, path-entropy scanner detection,
+trusted-proxy address resolution, a shared budget for multi-instance deployments, and a
+circuit breaker for a failing origin.
 
 Zero dependencies. Node 20+.
+
+**A block is never issued on evidence a client can forge.** Fingerprints and path entropy
+produce challenges and surcharges; only an exhausted budget, an open circuit or a cost
+ceiling can produce a 403. See "HTTP client fingerprinting" for why, and
+[the five limits](#running-more-than-one-instance) this package has.
 
 ```
 npm install siege-guard
@@ -91,25 +97,45 @@ with N = 300, a client sends 300 requests in the last second of one minute and 3
 first second of the next, and has made 600 in about two seconds without ever breaking the
 rule as written.
 
-This keeps two adjacent buckets and interpolates. The count moves continuously, so a
-boundary burst lands on a non-zero fraction of the previous bucket and cannot exceed the
-limit.
+This keeps two adjacent buckets and interpolates between them.
+
+**What that does and does not guarantee.** The attack above is closed: the test
 
 ```
 sliding window cannot be burst-exploited at a minute boundary
 ```
 
-is the test that proves it, and it fails against a fixed-window implementation.
+fails against a fixed-window implementation and passes here.
+
+It is still an *approximation*, not the exact set of the last 60 seconds. With two buckets,
+the oldest one is charged linearly for its partial overlap, so a client whose requests
+cluster at one end of the window is over-counted and one that clusters at the other end is
+under-counted. The error is bounded and small, and it is the same trade-off Cloudflare and
+Envoy make, because keeping every timestamp costs memory and CPU that the approximation
+avoids. If you need the exact answer, this is not the right algorithm and you want a real
+log of request times.
 
 Clock going backwards is clamped to zero. An NTP step must never hand out free quota, and
 the naive computation does exactly that: the older bucket gains weight instead of losing it.
 
-### 2. IPv6-aware identity
+### 2. IPv6-aware identity — and its limits
 
 This is the part naive limiters get wrong. Keying on the remote address is correct on IPv4
 and useless on IPv6. A single allocation is typically a **/64 — 18 446 744 073 709 551 616
 addresses**. An attacker rotates through them at will and every address gets a fresh budget,
 so the limiter's memory grows without bound while the attack continues.
+
+**What a /64 does not do.** It collapses one allocation into one budget, which stops
+in-alloc address rotation — the cheap trick. It does not stop an attacker who rotates
+*prefixes*, rents several VPS, or bounces through proxies: to those, each allocation is a
+separate identity and each one gets a full budget, exactly as a distributed IPv4 attack gets
+one budget per source address. A longer prefix (/56 or /48) makes that harder and starts
+catching legitimate users of large ISPs in the same bucket.
+
+Catching a genuinely distributed attacker needs something this package deliberately does not
+have: a global reputation signal aggregated across identities. Feed the block and throttle
+decisions into your SIEM, or run an ASN-level or account-level limit upstream of this. The
+per-identity budget here is one layer, not the whole answer.
 
 Identity is computed on a **prefix**, not an address:
 
@@ -195,42 +221,177 @@ enumeration.
 Note the minimum sample count is 8, and `log2(8) = 3.0` is still below the 3.4 threshold,
 so a short trace is correctly **not** flagged. Sixteen distinct paths give 4.0 and clear it.
 
-### 5. HTTP client fingerprinting, honestly limited
+### 5. HTTP client fingerprinting — and why it never bans anyone
 
-A full client fingerprint (JA3/JA4) is built from the TLS ClientHello. Node's `http` module
-does not expose it — by the time a handler runs, the handshake is finished and its bytes are
-gone. Reading it needs a TLS-terminating proxy, a native addon, or a TLS library that hands
-over the raw handshake.
+**Read this before trusting any of it.** Every signal below is forgeable in one line:
 
-So this works with what a plain Node server can actually see, and says so rather than
-pretending:
+```python
+requests.get(url, headers={
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/128.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document',
+})
+```
 
-| Signal | Weight | Fires when |
+That request scores **0.00** here, exactly like Chrome. An earlier version of this package
+blocked on the fingerprint score alone, which meant those six headers earned a permanent
+ban — a rule that punishes anyone who read the README and stops nothing.
+
+So a fingerprint is no longer allowed to convict. `src/policy.js` enforces it: a `BLOCK`
+requires a basis a client cannot manufacture, and `judge()` throws if a forgeable one ever
+reaches `blockBases`. A high score now earns exactly two things:
+
+- a **challenge**, if you wire one, and
+- a **surcharge**: 1.5× or 2× the base price, so a suspicious client exhausts its window
+  sooner and starts earning strikes.
+
+Both are about making suspicion *cost something*, not about declaring guilt. When the budget
+is finally exceeded, the block cites `budget-exceeded` — the one thing the client could not
+fake.
+
+The same applies to path entropy: an attacker who never repeats a path trivially keeps
+novelty at 1.0, so `blockOnScan` is **off by default** and an entropy verdict earns a
+challenge rather than a ban.
+
+Legitimate API clients are the other half of the problem. A `curl` call, a server-to-server
+integration, or a Go program sends a sparse header set and looks exactly like a scanner.
+`challengeScore` is therefore a question, not an assertion: set it above 0.47 and you will
+challenge ordinary integrations.
+
+What this module actually reads, and what it cannot:
+
+| Signal | Weight | Limit |
 | --- | --- | --- |
-| `noSecFetch` | 0.22 | no `sec-fetch-*` at all; browsers always send some |
-| `missingUserAgent` | 0.20 | user agent empty or absent |
-| `knownBotUserAgent` | 0.15 | names a known scanner or non-browser client |
-| `alphabeticalHeaders` | 0.18 | headers arrive sorted, a hash-map artefact |
-| `flatAcceptLanguage` | 0.05 | one language, no q-values |
-| `missingAcceptEncoding` | 0.05 | no `accept-encoding` |
-| `missingAccept` | 0.05 | no `accept` |
-| `rawSocket` | 0.10 | none of the above, and no user agent |
+| `noSecFetch` | 0.22 | trivially forged |
+| `missingUserAgent` | 0.20 | trivially forged |
+| `knownBotUserAgent` | 0.15 | one substring match away from a real browser |
+| `alphabeticalHeaders` | 0.18 | order is attacker-chosen |
+| `flatAcceptLanguage` | 0.05 | trivially forged |
+| `missingAcceptEncoding` | 0.05 | trivially forged |
+| `missingAccept` | 0.05 | trivially forged |
+| `rawSocket` | 0.10 | trivially forged |
 
-Measured on the demo traces:
+**Full JA3/JA4 needs the TLS ClientHello, which Node's `http` module does not expose** — by
+the time a handler runs, the handshake is finished and its bytes are gone. Reading it needs a
+TLS-terminating proxy, a native addon, or a TLS library that hands over the raw handshake.
+That is a real capability difference, and it is the difference between "this script looks
+automated" and "this is a known bot infrastructure".
+
+Measured:
 
 ```
-ordinary browser      0.00   looks like an ordinary browser
-python-requests       0.47   below the 0.6 block threshold
-bare socket           0.77   every signal fires
+ordinary browser      0.00
+python-requests       0.47
+fully forged          0.00   <- identical to a browser
+bare socket           0.77
 ```
 
-The header-order check reads `rawHeaders`, the actual wire order. An earlier version
-filtered through a list that was itself alphabetical and compared the filtered list against
-itself, so every request passed and the signal was decorative.
+Header order is read from `rawHeaders`, the real wire order. An earlier version filtered
+through a list that was itself alphabetical and compared the filtered list against itself, so
+every request matched and the signal was decorative.
 
-Limits, stated plainly: a determined attacker can forge all of these, they raise the cost of
-a casual scan rather than authenticating anyone, and behind a CDN the browser-shaped signals
-describe the CDN. Pass `behindProxy: true` and the package discounts them.
+Behind a CDN the browser-shaped signals describe the CDN. Pass `behindProxy: true` and they
+are discounted.
+
+## Running more than one instance
+
+**The default budget is per-process.** Run four Node processes behind a load balancer and an
+attacker who owns one IP gets four budgets. This is not a bug in the limiter; it is what
+happens when state lives in a process.
+
+The test asserts the failure rather than avoiding it, so the reason `src/store.js` exists
+cannot be quietly forgotten:
+
+```js
+// four guards, no shared store: 80 requests served
+// four guards, one shared store: 20 requests served, the same as one instance
+```
+
+Pass a store and the budget becomes global:
+
+```js
+const { createGuard, RedisStore, ResilientStore } = require('siege-guard');
+
+const guard = createGuard({
+  limit: 1000,
+  store: new ResilientStore({
+    primary: new RedisStore({ client: redisClient }),
+  }),
+});
+```
+
+Then use the async path, because a remote store is a network round trip:
+
+```js
+const decision = await guard.checkAsync(req);
+```
+
+`check()` throws if a store is configured, and `checkAsync()` throws if one is not. The two
+cannot be mixed up silently, which is how a limiter ends up admitting everything while
+looking configured.
+
+**The arithmetic has to be atomic.** A read followed by a write leaves a gap, and four
+processes in that gap each see room for one more request. `RedisStore` therefore ships a Lua
+script that trims the window and tests the budget in one server-side operation. A pipeline of
+`ZREMRANGEBYSCORE` → `ZCARD` → `ZADD` is not equivalent, and that mistake is common.
+
+A shared store also gives a place to put global state this package does not implement:
+per-identity strikes and blocked-until timestamps are still per-process, so with N instances
+a client needs N strikes before any one of them blocks it. Pass the same store for counters
+you need global, or accept the weaker guarantee.
+
+Redis is not bundled. Install it, point the client at it, and wire it up. **If Redis goes
+down, the site must not.** `ResilientStore` falls back to local memory and marks the result
+`backend: 'memory-fallback', degraded: true`, so a dashboard can show that the shared limit
+stopped being shared — a materially weaker defence, reported honestly rather than hidden.
+
+## Behind a reverse proxy
+
+`req.socket.remoteAddress` is whoever opened the TCP connection, which behind a proxy is
+always the proxy. Without help, every client behind it shares one budget and the limiter does
+nothing at all.
+
+Reading `X-Forwarded-For` is not the fix, because that header is client-controlled. Anyone
+can send `X-Forwarded-For: 1.2.3.4` and every proxy in the path appends to it, producing
+`1.2.3.4, <real client>`. Trust the leftmost entry and you have handed rate-limit identity to
+whoever asked for it.
+
+So the address is derived from the **trusted chain**, walked right to left:
+
+```js
+const guard = createGuard({
+  trustedProxies: ['127.0.0.1', '10.0.0.0/8'],
+});
+```
+
+1. Start from the socket, which cannot be forged.
+2. Walk backwards while each hop is a configured proxy.
+3. Stop at the first address that is not a proxy. That is the client, and it is the first
+   value no proxy has vouched for.
+
+The measured behaviour:
+
+```
+XFF: 5.6.7.8                                -> 5.6.7.8    the real client
+XFF: 1.2.3.4, 5.6.7.8                        -> 5.6.7.8    forged 1.2.3.4 discarded
+XFF: 1.2.3.4, 5.6.7.8, 9.10.11.12            -> 9.10.11.12  two forgeries discarded
+socket 198.51.100.5 + XFF: 1.2.3.4           -> 198.51.100.5  untrusted socket wins
+no trustedProxies configured + XFF: 1.2.3.4  -> the socket   headers ignored
+200 hops, maxHops 16                         -> null          refused, not parsed
+```
+
+An empty `trustedProxies` is the safe default: forwarding headers are ignored and every
+client is the socket address. Loopback is trusted automatically, because a local proxy is the
+ordinary case; set `trustLoopback: false` to require an explicit list.
+
+Configure your proxy to overwrite rather than append, and keep this list tight. A CIDR in
+`trustedProxies` means "anything in this range may speak for a client", so a broad range
+hands that power to whoever can run a host in it.
+
+`decision.address` carries the resolver's verdict, including `untrustedPrefix`, so a
+discarded forgery is visible in your logs rather than silent.
 
 ## The circuit breaker
 
@@ -288,9 +449,18 @@ $ echo "$DECISION" | siege-guard explain
 `ALLOW` · `THROTTLE` (429 + `Retry-After`) · `CHALLENGE` (403, when a challenge hook is
 configured) · `BLOCK` (403, or 503 when the circuit is open)
 
-The order is deliberate: circuit, then an existing block, then fingerprint, then the budget,
-then the scan verdict. Cheap and decisive checks come before arithmetic, so an attack that
-trips the breaker never reaches the counting.
+The order is deliberate: circuit, then an existing block, then the cost ceiling, then the
+budget, then a challenge, then the scan verdict. Cheap and decisive checks come before
+arithmetic, so an attack that trips the breaker never reaches the counting.
+
+**Fingerprint is not in that list as a blocking condition.** It appears only after the budget
+has been spent, where its influence is the surcharge and the optional challenge. Every 403
+carries a `bases` array naming why, and `judge()` throws rather than let a forgeable basis
+reach it:
+
+```js
+decision.bases;  // ['budget-exceeded']
+```
 
 Repeated excesses earn a strike; `strikesToBlock` (default 3) earns a block lasting `blockMs`
 (default 5 minutes). A released identity is **not** forgiven — the first request past a block
@@ -356,6 +526,8 @@ const guard = createGuard({
   blockMs: 300_000,
   blockOnScan: false,      // off by default: entropy alone will not block
   behindProxy: false,      // true when a CDN fronts the origin
+  trustedProxies: ['127.0.0.1'],  // whose forwarding headers to believe
+  store: null,             // a shared store; see "Running more than one instance"
   challenge: (req) => 'prove you are a browser',
   costs: { apiWrite: 80 }, // override the price of one route class
 });
@@ -376,15 +548,18 @@ const {
   createGuard, SiegeGuard, SlidingWindow, identityOf, classify,
   PathEntropyTracker, CircuitBreaker, fingerprint,
   guardMiddleware, attach, renderDecision, renderReport,
+  judge, mayBlock, BLOCK_BASES, CHALLENGE_BASES,
+  createAddressResolver, InMemoryStore, RedisStore, ResilientStore,
   ALLOW, THROTTLE, CHALLENGE, BLOCK, DEFAULTS,
 } = require('siege-guard');
 
-guard.check(req);          // a decision record
-guard.inspect(req);        // the same analysis, spending nothing
-guard.reportOrigin(ok);    // tell the breaker how the origin answered
-guard.forgive(address);    // clear every trace of one client
-guard.report();            // counters, circuit state, hottest identities
-guard.sweep();             // drop idle state
+guard.check(req);           // a decision record (single process)
+await guard.checkAsync(req); // the same, against a shared store
+guard.inspect(req);         // the same analysis, spending nothing
+guard.reportOrigin(ok);     // tell the breaker how the origin answered
+guard.forgive(address);     // clear every trace of one client
+guard.report();             // counters, budgetScope, hottest identities
+await guard.sweep();        // drop idle state, local and shared
 ```
 
 Every module is usable on its own. `SlidingWindow`, `CircuitBreaker` and `PathEntropyTracker`
@@ -397,8 +572,8 @@ $ npm test
 ```
 
 ```
-ℹ tests 144
-ℹ pass 144
+ℹ tests 215
+ℹ pass 215
 ℹ fail 0
 ```
 
