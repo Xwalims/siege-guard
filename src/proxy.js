@@ -63,6 +63,20 @@ function octetMask(i, bits) {
  * address is the only safe answer, since a caller that cannot parse the peer
  * has no business trusting it.
  *
+ * Leading zeros are rejected as well, and that one costs a page of history.
+ * `Number('010')` is 10 in decimal but 8 in octal to a reader expecting octal,
+ * so `010.000.000.001`, `001.1.1.1` and `192.168.001.1` each name a
+ * *different* address depending on who parses them. `node:net`'s `isIPv4`
+ * rejects all of them, as does python's `ipaddress`; both were checked.
+ *
+ * That matters here because the chain walk feeds attacker-written header text
+ * straight back into this function: `current = candidate` on the way back
+ * through the X-Forwarded-For loop. With `trustedProxies: ['10.0.0.0/8']` and a
+ * real proxy on `10.0.0.1`, the header `"6.6.6.6, 010.000.000.001"` was read as
+ * a two-hop chain whose middle hop was `10.0.0.1`, so the walk believed the
+ * attacker's leftmost `6.6.6.6` AND reported the whole chain as trusted. A
+ * malformed octet must not be a way to spell a trusted address.
+ *
  * @param {string} text
  * @returns {number[]|null} four octets, or null
  */
@@ -72,6 +86,8 @@ function parseIPv4(text) {
   const out = new Array(4);
   for (let i = 0; i < 4; i += 1) {
     if (!/^\d{1,3}$/.test(parts[i])) return null;
+    // `010` is not a decimal 10 -- it is ambiguous, so it is not an address.
+    if (parts[i].length > 1 && parts[i][0] === '0') return null;
     const n = Number(parts[i]);
     if (!Number.isInteger(n) || n < 0 || n > 255) return null;
     out[i] = n;

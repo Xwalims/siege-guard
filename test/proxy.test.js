@@ -225,6 +225,63 @@ test('a malformed peer address resolves to itself, with no headers believed', ()
 });
 
 // ---------------------------------------------------------------------------
+// Leading zeros: a second spelling of a trusted address
+//
+// The chain walk calls `current = candidate`, feeding header text back into
+// isTrusted(). So any string the parser accepts is a string that can name a
+// proxy hop. `Number('010')` is decimal 10, which meant "010.000.000.001" was
+// read as "10.0.0.1" -- and the attacker's leftmost entry got believed.
+// ---------------------------------------------------------------------------
+
+test('an octet with a leading zero is not an address', () => {
+  // node:net's isIPv4 and python's ipaddress both reject all of these; they
+  // are the two ground truths this was checked against, because "is 010 a ten
+  // or an eight?" has more than one answer in the wild and only one of them is
+  // safe to guess.
+  const r = createAddressResolver({ trustedProxies: ['10.0.0.0/8'], trustLoopback: false });
+  for (const bad of ['010.0.0.1', '010.000.000.001', '001.1.1.1', '192.168.001.1', '00.0.0.0']) {
+    assert.equal(r.isTrusted(bad), false, `${bad} must not be trusted`);
+  }
+  // And the shapes that must keep working, so the rule is not simply "reject
+  // anything unusual": a bare 0 octet is fine, and so is the real address.
+  // 0.0.0.0 is NOT inside 10.0.0.0/8 (ipaddress agrees), so the range that
+  // contains it is used to exercise the bare-zero case honestly.
+  assert.equal(r.isTrusted('10.0.0.1'), true);
+  assert.equal(r.isTrusted('10.1.2.3'), true);
+  const all = createAddressResolver({ trustedProxies: ['0.0.0.0/0'], trustLoopback: false });
+  assert.equal(all.isTrusted('0.0.0.0'), true, 'a single 0 octet is not a leading zero');
+  assert.equal(all.isTrusted('0.0.0.1'), true);
+  assert.equal(all.isTrusted('192.168.1.1'), true);
+  // Loopback is not in this resolver's list (trustLoopback: false above), so it
+  // is NOT trusted here -- checked to keep the two settings from being confused.
+  assert.equal(r.isTrusted('127.0.0.1'), false, 'loopback was not configured as trusted');
+  const withLoopback = createAddressResolver({ trustedProxies: ['10.0.0.0/8'] });
+  assert.equal(withLoopback.isTrusted('127.0.0.1'), true, 'loopback is trusted when enabled');
+});
+
+test('a leading-zero hop cannot smuggle a forged XFF through the chain', () => {
+  // The exploit, end to end. A real proxy on 10.0.0.1, a /8 trusted range, and a
+  // header that spells the proxy hop with leading zeros.
+  const r = createAddressResolver({ trustedProxies: ['10.0.0.0/8'], trustLoopback: false });
+
+  // The honest chain for comparison: one hop too many, so the leftmost entry is
+  // discarded and the whole chain is untrusted.
+  const honest = r.resolve(req('10.0.0.1', { 'x-forwarded-for': '6.6.6.6, 203.0.113.9' }));
+  assert.equal(honest.address, '203.0.113.9');
+  assert.equal(honest.trusted, false);
+  assert.equal(honest.untrustedPrefix, true);
+
+  // Before the fix this one resolved to 6.6.6.6 with trusted === true, because
+  // the middle hop was believed to be 10.0.0.1. Now the hop is not an address,
+  // so the walk stops there: the malformed entry is treated as an untrusted
+  // stranger and the attacker's leftmost entry is discarded along with it.
+  const forged = r.resolve(req('10.0.0.1', { 'x-forwarded-for': '6.6.6.6, 010.000.000.001' }));
+  assert.notEqual(forged.address, '6.6.6.6', 'the forged leftmost entry must NOT be believed');
+  assert.equal(forged.untrustedPrefix, true);
+  assert.equal(forged.trusted, false, 'a chain containing a malformed hop is not trusted');
+});
+
+// ---------------------------------------------------------------------------
 // Resource exhaustion through the header
 // ---------------------------------------------------------------------------
 
