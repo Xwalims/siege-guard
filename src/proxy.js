@@ -31,6 +31,54 @@
 /** Headers that carry a proxy chain, in the order they are consulted. */
 const CHAIN_HEADERS = Object.freeze(['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']);
 
+/**
+ * The mask for octet `i` of a `bits`-wide IPv4 prefix.
+ *
+ * The shift has to be clamped to 0..8. Written as
+ * `0xff << (8 - (bits - i * 8))` the shift goes *negative* for every octet that
+ * is entirely inside the prefix once `bits - i * 8` exceeds 8 -- that is, for
+ * every octet except the last partially-covered one. JavaScript does not throw
+ * on a negative shift, it masks the count with `& 31`, so `0xff << -7` is
+ * `0xff << 25`, i.e. 0. The result was that octet 0 of a `/16` compared against
+ * a mask of 0: `10.0.0.0/16` reported `192.0.0.1` and `11.0.0.1` as inside it,
+ * trusting 256x more addresses than configured, and believing the X-Forwarded-For
+ * of an attacker outside the proxy range.
+ *
+ * @param {number} i 0..3
+ * @param {number} bits 0..32
+ * @returns {number} 0..255
+ */
+function octetMask(i, bits) {
+  const significant = Math.max(0, Math.min(8, bits - i * 8));
+  if (significant === 0) return 0;
+  return (0xff << (8 - significant)) & 0xff;
+}
+
+/**
+ * Parse a dotted-quad into four integers, or return null.
+ *
+ * `Number('zzz')` is NaN, and every comparison against NaN is false, so a
+ * malformed octet used to make an address silently match any prefix it should
+ * have failed: `10.zzz.0.0` was "inside" `10.0.0.0/16`. Rejecting the whole
+ * address is the only safe answer, since a caller that cannot parse the peer
+ * has no business trusting it.
+ *
+ * @param {string} text
+ * @returns {number[]|null} four octets, or null
+ */
+function parseIPv4(text) {
+  const parts = String(text).split('.');
+  if (parts.length !== 4) return null;
+  const out = new Array(4);
+  for (let i = 0; i < 4; i += 1) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const n = Number(parts[i]);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
 /** Headers that carry exactly one address, not a chain. */
 const SINGLE_HEADERS = Object.freeze([
   'cf-connecting-ip',
@@ -68,19 +116,20 @@ function createAddressResolver(options = {}) {
   function isTrusted(address) {
     if (!address) return false;
     if (trusted.includes(address)) return true;
+    const octets = parseIPv4(address);
+    if (!octets) return false;
     for (const entry of trusted) {
       const slash = entry.indexOf('/');
       if (slash === -1) continue;
       const base = entry.slice(0, slash);
       const bits = Number(entry.slice(slash + 1));
       if (!Number.isInteger(bits) || bits < 0 || bits > 32) continue;
-      const octets = address.split('.');
-      const baseOctets = base.split('.');
-      if (octets.length !== 4 || baseOctets.length !== 4) continue;
+      const baseOctets = parseIPv4(base);
+      if (!baseOctets) continue;
       let ok = true;
       for (let i = 0; i < 4; i += 1) {
-        const mask = i * 8 >= bits ? 0 : 0xff << (8 - Math.max(0, bits - i * 8)) & 0xff;
-        if ((Number(octets[i]) & mask) !== (Number(baseOctets[i]) & mask)) ok = false;
+        const mask = octetMask(i, bits);
+        if ((octets[i] & mask) !== (baseOctets[i] & mask)) ok = false;
       }
       if (ok) return true;
     }

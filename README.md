@@ -398,6 +398,35 @@ Configure your proxy to overwrite rather than append, and keep this list tight. 
 `trustedProxies` means "anything in this range may speak for a client", so a broad range
 hands that power to whoever can run a host in it.
 
+IPv4 CIDRs are supported; IPv6 prefixes are refused rather than half-understood. A peer
+address that is not a valid dotted quad is not trusted at all -- `Number('zzz')` is NaN and
+every comparison against NaN is false, so accepting one would make a malformed address
+match prefixes it should have failed.
+
+### The mask arithmetic, which is easy to get subtly wrong
+
+Computing the per-octet mask as `0xff << (8 - (bits - i * 8))` looks right and is not.
+The shift goes **negative** as soon as an octet is entirely covered by the prefix, and
+JavaScript does not raise on a negative shift -- it masks the count with `& 31`, so
+`0xff << -7` becomes `0xff << 25`, which is zero. Octet 0 of a `/16` was therefore compared
+against a mask of `0` and never checked at all:
+
+```
+trustedProxies: ['10.0.0.0/16']
+  192.0.0.1     reported inside    (octet 0 unchecked)
+  11.0.0.1      reported inside    (octet 0 unchecked)
+  172.31.255.254 reported outside   (accidentally right, via octet 1)
+```
+
+The effect was not cosmetic. `isTrusted` decides whether a peer counts as a proxy, so
+`10.0.0.0/16` believed the `X-Forwarded-For` of anyone whose second octet was zero -- a
+256x wider trust set than configured, and the forged-header rule above quietly defeated for
+every deployment that did not happen to use a `/8`. Only `/0`-`/8` were ever correct, which is
+why the original tests, all of which used a `/8`, passed.
+
+`test/proxy.test.js` now flips every bit of every octet at all 32 prefix lengths and checks
+each against the prefix arithmetic, so no mask position can go unchecked again.
+
 `decision.address` carries the resolver's verdict, including `untrustedPrefix`, so a
 discarded forgery is visible in your logs rather than silent.
 
