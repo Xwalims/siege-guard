@@ -403,6 +403,23 @@ class SiegeGuard {
       options: this.options,
     });
 
+    // The cost ceiling, at the same point in the order as check() step 4: a
+    // request priced above the operator's ceiling is refused BEFORE any budget
+    // work, so it costs nothing to the identity that sent it. It was missing
+    // here, which meant the guard quietly admitted unbounded-cost requests on
+    // exactly the deployment shape that matters most -- one process, one
+    // shared Redis budget -- while the in-process path refused them.
+    if (
+      this.options.maxCostPerRequest > 0 &&
+      details.cost.cost > this.options.maxCostPerRequest
+    ) {
+      return this.decide(BLOCK, details, {
+        reason: `request costs ${details.cost.cost}, above the per-request ceiling ${this.options.maxCostPerRequest}`,
+        status: 403,
+        bases: [BLOCK_BASES.CEILING],
+      });
+    }
+
     const priced = Math.max(1, Math.round(details.cost.cost * verdict.priceMultiplier));
     const budget = await this.sharedStore.spend(
       key,

@@ -167,6 +167,111 @@ test('checkAsync without a shared store is a clear error', async () => {
   await assert.rejects(() => guard.checkAsync(req()), /checkAsync needs a shared store/);
 });
 
+test('the cost ceiling is enforced on the shared-store path too', async () => {
+  // check() refused an over-ceiling request at step 4, before any budget work.
+  // checkAsync() had no equivalent and simply allowed it, so the one shape an
+  // operator actually deploys -- a process with a shared Redis budget -- accepted
+  // unbounded-cost requests that the in-process path rejected. Same policy, same
+  // request, opposite answers.
+  //
+  // `costs` is a per-class table, not a callable, so the ceiling is crossed by
+  // pricing an API read at 100 against a ceiling of 10.
+  const ceiling = {
+    now: () => 1_000_000,
+    limit: 1_000_000,
+    maxCostPerRequest: 10,
+    costs: { apiRead: 100 },
+  };
+  const expensive = { ...req(), url: '/api/thing' };
+
+  const single = new SiegeGuard(ceiling);
+  assert.equal(single.inspect(expensive).cost.cost, 100, 'sanity: the request is priced over the ceiling');
+  const local = single.check(expensive);
+  assert.equal(local.action, 'block', 'in-process path must refuse an over-ceiling request');
+  assert.deepEqual(local.bases, ['cost-ceiling']);
+
+  const shared = new SiegeGuard({ ...ceiling, store: new InMemoryStore() });
+  const distributed = await shared.checkAsync(expensive);
+  assert.equal(distributed.action, 'block', 'shared-store path must refuse it identically');
+  assert.equal(distributed.status, 403);
+  assert.deepEqual(distributed.bases, ['cost-ceiling']);
+});
+
+test('an over-ceiling request costs the identity nothing', async () => {
+  // The ceiling is refused before budget work, so it must not spend the budget
+  // of whoever sent it -- otherwise one over-priced request could lock an honest
+  // client out by exhausting a budget it was never allowed to draw on.
+  const store = new InMemoryStore();
+  const guard = new SiegeGuard({
+    now: () => 1_000_000,
+    limit: 1_000_000,
+    maxCostPerRequest: 10,
+    costs: { apiRead: 100 },
+    store,
+  });
+  for (let i = 0; i < 5; i += 1) {
+    const decision = await guard.checkAsync({ ...req(), url: '/api/thing' });
+    assert.equal(decision.action, 'block');
+  }
+  assert.equal((await store.peek(identityKeyFor('198.51.100.1'), 60_000, 1_000_000)).used, 0);
+});
+
+test('check() and checkAsync() apply the same decision steps in the same order', () => {
+  // The two bodies are near-copies by design, which is exactly why a step can
+  // quietly exist in one and not the other: the cost ceiling was enforced by
+  // check() only, so a shared-store deployment allowed what an in-process one
+  // refused. The steps are listed here rather than derived from the source, so
+  // a new step has to be added to both lists deliberately and the diff stays
+  // reviewable. Order is asserted too, because "circuit after the ceiling"
+  // changes what an operator sees during an origin outage.
+  const steps = [
+    'details.circuit.allow',            // 1. origin is failing
+    'details.blockedUntil > now',       // 2. a previous excess earned a block
+    'judge({',                          // 3. combine signals, never convict on one
+    'maxCostPerRequest > 0',            // 4. the operator's cost ceiling
+    '!budget.allowed',                  // 5. the budget was actually exceeded
+    "verdict.verdict === 'challenge'",  // 6. ask for proof, affordably
+    'options.blockOnScan',              // 7. an operator may make a scan fatal
+  ];
+
+  const source = require('node:fs').readFileSync(require.resolve('../src/guard.js'), 'utf8');
+  const sync = sliceBody(source, '  check(req, options = {}) {', '\n  async checkAsync');
+  const async_ = sliceBody(source, '  async checkAsync(req, options = {}) {', '\n  /**\n   * Record an excess');
+
+  const positions = (body) =>
+    steps.map((token) => body.indexOf(token));
+
+  const a = positions(sync);
+  const b = positions(async_);
+  for (let i = 0; i < steps.length; i += 1) {
+    assert.notEqual(a[i], -1, `check() is missing step ${i + 1}: ${steps[i]}`);
+    assert.notEqual(b[i], -1, `checkAsync() is missing step ${i + 1}: ${steps[i]}`);
+  }
+  assert.deepEqual(a, [...a].sort((x, y) => x - y), 'check() applies the steps out of order');
+  assert.deepEqual(b, [...b].sort((x, y) => x - y), 'checkAsync() applies the steps out of order');
+
+  // Every block basis the guard can emit must be reachable on both paths, or a
+  // 403 that one path can produce is a 403 the other cannot explain.
+  const bases = [...new Set([...sync.matchAll(/BLOCK_BASES\.(\w+)/g)].map((m) => m[1]))].sort();
+  const sharedBases = [...new Set([...async_.matchAll(/BLOCK_BASES\.(\w+)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual(sharedBases, bases, 'the two paths can emit different block bases');
+});
+
+function sliceBody(source, start, end) {
+  const from = source.indexOf(start);
+  assert.notEqual(from, -1, `could not find ${start.trim()}`);
+  const to = source.indexOf(end, from + start.length);
+  assert.notEqual(to, -1, `could not find the end of ${start.trim()}`);
+  return source.slice(from, to);
+}
+
+// The identity key the guard derives from a socket address, without reaching into
+// guard internals: if this drifts, the assertion above stops testing anything.
+function identityKeyFor(address) {
+  const { identityOf } = require('../src/identity.js');
+  return identityOf(address, {}).normalized;
+}
+
 test('the report says whether the budget is shared', () => {
   const local = new SiegeGuard({ now: () => 1_000_000 });
   assert.equal(local.report().budgetScope, 'in-process');

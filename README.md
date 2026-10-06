@@ -506,6 +506,11 @@ The order is deliberate: circuit, then an existing block, then the cost ceiling,
 budget, then a challenge, then the scan verdict. Cheap and decisive checks come before
 arithmetic, so an attack that trips the breaker never reaches the counting.
 
+`check()` and `checkAsync()` apply that order identically, and are covered by a test that
+walks both step lists so they cannot quietly drift apart. They diverge only in how the budget
+is spent: an in-process `SlidingWindow` versus `await store.spend(...)`, which is why a guard
+with a shared store refuses the synchronous call instead of pretending to serve it.
+
 **Fingerprint is not in that list as a blocking condition.** It appears only after the budget
 has been spent, where its influence is the surcharge and the optional challenge. Every 403
 carries a `bases` array naming why, and `judge()` throws rather than let a forgeable basis
