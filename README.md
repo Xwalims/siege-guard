@@ -118,6 +118,22 @@ log of request times.
 Clock going backwards is clamped to zero. An NTP step must never hand out free quota, and
 the naive computation does exactly that: the older bucket gains weight instead of losing it.
 
+**`Retry-After` is a promise the limiter keeps.** A client told to wait `retryAfterMs` is
+admitted when it waits exactly that long — never refused again for obeying the header. The
+delay is the *shortest* wait that works, so it neither stalls a client whose budget is already
+free nor lies about when it returns. The cost curve is piecewise linear, so it takes at most
+two phases: the older bucket decays for the rest of the current window, and the newer bucket
+then decays over a full window after the roll-over. Both phases are pinned by tests that
+re-ask the real accept path at the promised instant rather than restating the formula:
+
+```
+a honoured retry delay really does admit the client when it returns
+```
+
+Note that the answer is sometimes *more* than one window. A budget spent entirely at t=0 sits
+in a bucket that does not start decaying until the window rolls over, so a cost-1 request
+against a limit of 10 first fits at t=66 000, not t=60 000.
+
 ### 2. IPv6-aware identity — and its limits
 
 This is the part naive limiters get wrong. Keying on the remote address is correct on IPv4

@@ -96,9 +96,16 @@ class SlidingWindow {
   /**
    * Interpolate the two buckets into a single cost.
    *
+   * The buckets returned alongside the cost are the ones the cost was computed
+   * from, already pruned of anything that has slid out of the window. Callers
+   * that reason about the individual buckets (consume()'s retry calculation)
+   * must use these rather than reading state.older/state.newer directly, or
+   * they reason about buckets that this method has just discarded.
+   *
    * @param {{older: Bucket|null, newer: Bucket|null}} state
    * @param {number} now
-   * @returns {{cost: number, olderWeight: number}}
+   * @returns {{cost: number, olderWeight: number, older: Bucket|null,
+   *            newer: Bucket|null}}
    */
   weighted(state, now) {
     const index = Math.floor(now / this.windowMs);
@@ -121,7 +128,7 @@ class SlidingWindow {
 
     const cost =
       (older ? older.cost * (1 - fraction) : 0) + (newer ? newer.cost : 0);
-    return { cost, olderWeight: 1 - fraction };
+    return { cost, olderWeight: 1 - fraction, older, newer };
   }
 
   /**
@@ -146,26 +153,45 @@ class SlidingWindow {
       this.keys.set(key, state);
     }
 
-    const { cost: current, olderWeight } = this.weighted(state, now);
+    const { cost: current, olderWeight, older, newer } = this.weighted(state, now);
     const projected = current + spend;
 
     if (projected > this.limit) {
-      // The window must slide until enough of the older bucket falls out that
-      // the request fits. Solve for the fraction that makes it fit:
-      //   newer.cost + older.cost * w + spend <= limit
-      //   w <= (limit - newer.cost - spend) / older.cost
-      const newerCost = state.newer ? state.newer.cost : 0;
-      const olderCost = state.older ? state.older.cost : 0;
+      // How long until this request fits? The cost curve is piecewise linear in
+      // time, so the answer is found in at most two phases.
+      //
+      // cost(t) = older.cost * (1 - (t - index*W)/W) + newer.cost
+      //   for the rest of this window: the older bucket keeps decaying while the
+      //   newer one is charged in full.
+      // cost(t) = newer.cost * (1 - (t - (index+1)*W)/W)
+      //   once the window rolls over: the newer bucket becomes the older one and
+      //   decays over a FULL window, not the remainder of the current one.
+      // cost(t) = 0 afterwards.
+      //
+      // The buckets used are the ones `current` was computed from, not the raw
+      // fields on `state`: weighted() discards buckets that have slid out of
+      // the window without touching state, so reading state here would reason
+      // about cost this request is not being charged for.
+      const newerCost = newer ? newer.cost : 0;
+      const olderCost = older ? older.cost : 0;
+      const startOfNextWindow = (index + 1) * this.windowMs;
       let waitMs;
-      if (olderCost > 0 && limit - newerCost - spend >= 0) {
-        const maxWeight = (limit - newerCost - spend) / olderCost;
-        // weight falls from `olderWeight` to 0 over the remainder of this bucket
-        const dropPerMs = olderWeight / this.windowMs;
-        waitMs = dropPerMs > 0 ? Math.ceil((olderWeight - maxWeight) / dropPerMs) : 0;
+
+      if (olderCost > 0 && this.limit - newerCost - spend >= 0) {
+        // Phase 1: enough of the older bucket falls out before the roll-over
+        // that the request already fits.
+        const maxWeight = (this.limit - newerCost - spend) / olderCost;
+        waitMs = Math.ceil(this.windowMs * (olderWeight - maxWeight));
+      } else if (newerCost > 0 && spend <= this.limit) {
+        // Phase 2: the newer bucket has to decay on its own, which takes up to
+        // a whole window past the roll-over.
+        const weightNeeded = Math.max(0, 1 - (this.limit - spend) / newerCost);
+        waitMs = Math.ceil(startOfNextWindow - now + weightNeeded * this.windowMs);
       } else {
-        // Only the newer bucket matters, so wait for it to become the older one
-        // and age out.
-        waitMs = Math.ceil(this.windowMs - (now - index * this.windowMs));
+        // The request on its own costs more than the whole budget, so no amount
+        // of waiting makes room for it. Report when the window rolls over,
+        // which is the soonest the state could possibly change.
+        waitMs = Math.ceil(startOfNextWindow - now);
       }
       return {
         allowed: false,
