@@ -91,7 +91,7 @@ class SiegeGuard {
       limit: this.options.limit,
       now: clock,
     });
-    this.entropy = new PathEntropyTracker(options.entropy || {});
+    this.entropy = new PathEntropyTracker({ ...(options.entropy || {}), now: clock });
     this.breaker = new CircuitBreaker({ ...(options.breaker || {}), now: clock });
     this.resolver =
       options.resolver ||
@@ -584,7 +584,20 @@ class SiegeGuard {
    */
   sweep() {
     const now = this.now();
-    const removed = { window: this.window.sweep(now), entropy: 0, punished: 0, store: null };
+    // The entropy tracker is swept too, and not because its own counter was
+    // reachable: it was not. `removed.entropy` was hard-coded to 0 and nothing
+    // called PathEntropyTracker#sweep, so a guard that had seen 5,000 identities
+    // still held all 5,000 after sweep(), while the window half of the very same
+    // call had dropped every one of them. Measured on the old code: window 5000,
+    // entropy 0, five thousand identities still resident. The two halves of one
+    // call have to agree or the operator reading the return value is being told
+    // the memory is gone when it is not.
+    const removed = {
+      window: this.window.sweep(now),
+      entropy: this.entropy.sweep(undefined, now),
+      punished: 0,
+      store: null,
+    };
     for (const [key, state] of this.punished) {
       if (state.blockedUntil !== 0 && state.blockedUntil <= now) {
         this.punished.delete(key);

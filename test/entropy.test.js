@@ -160,6 +160,85 @@ test('reset forgets an identity completely', () => {
   assert.equal(tracker.reset('c'), false);
 });
 
+// ---------------------------------------------------------------------------
+// sweep() must actually drop identities
+//
+// It used to test `entry.lastSeen`, which no code path ever wrote. The field
+// was `undefined` on every entry, so the guard condition could never be true and
+// the method returned 0 for every input -- 20,000 identities and ten hours of
+// idle time still left all 20,000 resident, which is the slow DoS the README
+// tells operators to call sweep() to prevent. These tests pin the three
+// properties the old code had none of: a stale identity is dropped, a fresh one
+// is not, and an ignored (static) request still counts as activity.
+// ---------------------------------------------------------------------------
+
+test('sweep drops identities that have gone idle', () => {
+  let t = 1_000_000;
+  const tracker = new PathEntropyTracker({ now: () => t, sweepKeepMs: 300_000 });
+  for (let i = 0; i < 50; i += 1) tracker.observe(`10.0.0.${i}`, `/p/${i}`);
+  assert.equal(tracker.state.size, 50);
+
+  // An identity with no usable timestamp is the old code's failure mode, so it
+  // is asserted directly rather than left to the shape of the entry object.
+  assert.equal(
+    tracker.state.get('10.0.0.0').lastSeen,
+    t,
+    'observe() must stamp the identity, or sweep has nothing to compare against',
+  );
+
+  t += 299_000;
+  assert.equal(tracker.sweep(), 0, 'an identity inside the keep window must be kept');
+  assert.equal(tracker.state.size, 50);
+
+  t += 2_000;
+  assert.equal(tracker.sweep(), 50, 'every idle identity must be dropped');
+  assert.equal(tracker.state.size, 0);
+});
+
+test('sweep keeps an identity that is still active', () => {
+  let t = 1_000_000;
+  const tracker = new PathEntropyTracker({ now: () => t, sweepKeepMs: 10_000 });
+  tracker.observe('quiet', '/a');
+  t += 60_000;
+  tracker.observe('loud', '/b');
+  // Only the re-stamped identity survives, even though the sweep is a single
+  // pass over the same map.
+  assert.equal(tracker.sweep(10_000, t), 1);
+  assert.equal(tracker.state.has('quiet'), false);
+  assert.equal(tracker.state.has('loud'), true);
+});
+
+test('an identity that only requests ignored assets is still tracked and sweepable', () => {
+  // Static assets never enter the sample, so an entry built only from them has
+  // an empty `order`. It is still a real client, and before this fix it was a
+  // permanent leak with nothing to sweep it: `samples` was 0, but the identity
+  // had to be countable for the memory claim in the README to be true.
+  let t = 1_000_000;
+  const tracker = new PathEntropyTracker({ now: () => t, sweepKeepMs: 1_000 });
+  const verdict = tracker.observe('assets', '/app.4f2a91.js');
+  assert.equal(verdict.ignored, true);
+  assert.equal(verdict.samples, 0, 'an ignored path must not enter the sample');
+  assert.equal(tracker.state.size, 1, 'but the identity must still be held so it can be swept');
+  t += 2_000;
+  assert.equal(tracker.sweep(1_000, t), 1);
+  assert.equal(tracker.state.size, 0);
+});
+
+test('an entry with no timestamp is dropped rather than kept forever', () => {
+  // The precise old failure: `lastSeen` absent meant the old condition was
+  // false, so the entry survived every sweep. Unknown liveness must not mean
+  // immortal.
+  const tracker = new PathEntropyTracker({ now: () => 1_000 });
+  tracker.state.set('legacy', {
+    order: [],
+    seen: new Set(),
+    requests: 0,
+    novel: 0,
+  });
+  assert.equal(tracker.sweep(1_000_000, 2_000_000), 1);
+  assert.equal(tracker.state.has('legacy'), false);
+});
+
 test('a scan verdict names the numbers that produced it', () => {
   const verdict = runTrace(HOSTILE_TRACE);
   assert.match(verdict.reason, /entropy [\d.]+ >= 3\.4/);

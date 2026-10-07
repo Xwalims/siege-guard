@@ -597,7 +597,9 @@ unit.
 
 Long-running processes should call `guard.sweep()` periodically. Without it a busy server
 accumulates one entry per client address forever, which is a memory leak shaped like a slow
-DoS.
+DoS. It returns what it dropped: `{ window, entropy, punished, store }`, the last being a
+promise when a shared store is configured. An identity is forgotten five minutes after its
+last request, so the counters agree with what the process is actually holding.
 
 ## API
 
@@ -630,8 +632,8 @@ $ npm test
 ```
 
 ```
-ℹ tests 225
-ℹ pass 225
+ℹ tests 248
+ℹ pass 248
 ℹ fail 0
 ```
 

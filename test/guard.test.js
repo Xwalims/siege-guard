@@ -344,6 +344,39 @@ test('sweep drops expired blocks', () => {
   assert.equal(h.guard.punished.size, 0);
 });
 
+// The two halves of one sweep() call have to agree. `removed.entropy` was
+// hard-coded to 0 and PathEntropyTracker#sweep was never called, so a guard that
+// had seen 5,000 identities dropped all 5,000 from its window and kept all
+// 5,000 in its entropy map -- measured on the old code. The counter read 0
+// while the memory stayed, which is the shape of a metric that makes an
+// operator stop looking.
+test('sweep drops idle identities from BOTH the window and the entropy map', () => {
+  const h = makeGuard({ limit: 100_000 });
+  for (let i = 0; i < 200; i += 1) {
+    h.guard.check(request(`/p/${i}`, { address: `10.0.${(i >> 8) & 0xff}.${i & 0xff}`, headers: BROWSER }));
+  }
+  assert.equal(h.guard.entropy.state.size, 200);
+  assert.equal(h.guard.window.keys.size, 200);
+
+  h.advance(10 * 60_000);
+  const removed = h.guard.sweep();
+  assert.equal(removed.entropy, 200, 'the entropy counter must report what it dropped');
+  assert.equal(removed.window, 200);
+  assert.equal(h.guard.entropy.state.size, 0, 'no identity may survive the sweep');
+  assert.equal(h.guard.window.keys.size, 0);
+});
+
+test('sweep keeps an identity that is still sending traffic', () => {
+  const h = makeGuard({ limit: 100_000 });
+  h.guard.check(request('/a', { address: '10.1.1.1', headers: BROWSER }));
+  h.advance(9 * 60_000);
+  h.guard.check(request('/b', { address: '10.1.1.2', headers: BROWSER }));
+  const removed = h.guard.sweep();
+  assert.equal(removed.entropy, 1, 'only the idle identity may be dropped');
+  assert.equal(h.guard.entropy.state.has('10.1.1.2'), true);
+  assert.equal(h.guard.entropy.state.has('10.1.1.1'), false);
+});
+
 test('the report accounts for every decision', () => {
   const { guard } = makeGuard();
   guard.check(request('/', { headers: BROWSER }));

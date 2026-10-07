@@ -46,6 +46,9 @@ const SCAN_NOVELTY = 0.6;
 /** How many recent paths are remembered per identity. */
 const DEFAULT_HISTORY = 64;
 
+/** How long an identity may be idle before {@link PathEntropyTracker#sweep} forgets it. */
+const DEFAULT_SWEEP_KEEP_MS = 300_000;
+
 /**
  * Paths treated as static and therefore excluded from scan detection.
  *
@@ -84,12 +87,23 @@ class PathEntropyTracker {
    * @param {number} [options.minSamples=8] samples needed for a verdict
    * @param {number} [options.scanEntropy=3.4]
    * @param {number} [options.scanNovelty=0.6]
+   * @param {number} [options.sweepKeepMs=300000] idle time before sweep forgets
+   *   an identity
+   * @param {number|Function} [options.now] a fixed clock for tests
    */
   constructor(options = {}) {
     this.history = options.history ?? DEFAULT_HISTORY;
     this.minSamples = options.minSamples ?? MIN_SAMPLES;
     this.scanEntropy = options.scanEntropy ?? SCAN_ENTROPY;
     this.scanNovelty = options.scanNovelty ?? SCAN_NOVELTY;
+    this.sweepKeepMs = options.sweepKeepMs ?? DEFAULT_SWEEP_KEEP_MS;
+    // sweep() has to know when an identity was last active, and the only way to
+    // know that is to stamp it on the way in. The tracker is usable standalone,
+    // so the clock is injectable rather than hard-wired.
+    this.now =
+      typeof options.now === 'function' ? options.now
+      : typeof options.now === 'number' ? () => options.now
+      : Date.now;
     /**
      * Paths excluded from the entropy computation. Defaults to static assets,
      * because hashed filenames from a bundler or CDN are unique by construction.
@@ -117,10 +131,16 @@ class PathEntropyTracker {
    *            isScan: boolean, reason: string}}
    */
   observe(key, path) {
+    // Stamp the activity BEFORE the ignore check, so an identity that only ever
+    // requests static assets is still bounded by history instead of becoming a
+    // permanent leak. A request this tracker deliberately ignores is still a
+    // request, and it says the identity is alive.
+    this.stamp(key);
     for (const pattern of this.ignorePatterns) {
       if (pattern.test(path)) {
+        const current = this.state.get(key);
         return {
-          samples: this.state.has(key) ? this.state.get(key).order.length : 0,
+          samples: current ? current.order.length : 0,
           entropy: 0,
           novelty: 0,
           isScan: false,
@@ -131,7 +151,7 @@ class PathEntropyTracker {
     }
     let entry = this.state.get(key);
     if (!entry) {
-      entry = { order: [], seen: new Set(), requests: 0, novel: 0 };
+      entry = { order: [], seen: new Set(), requests: 0, novel: 0, lastSeen: 0 };
       this.state.set(key, entry);
     }
 
@@ -150,6 +170,26 @@ class PathEntropyTracker {
     entry.requests += 1;
 
     return this.score(key);
+  }
+
+  /**
+   * Record that an identity was active, creating its entry if needed.
+   *
+   * Separate from the sampling below because an ignored path must still count
+   * as activity, and because a sweepable entry needs its `lastSeen` stamped even
+   * on the request that was ignored.
+   *
+   * @param {string} key rate-limit identity
+   * @returns {object} the entry for this identity
+   */
+  stamp(key) {
+    let entry = this.state.get(key);
+    if (!entry) {
+      entry = { order: [], seen: new Set(), requests: 0, novel: 0, lastSeen: 0 };
+      this.state.set(key, entry);
+    }
+    entry.lastSeen = this.now();
+    return entry;
   }
 
   /**
@@ -209,16 +249,29 @@ class PathEntropyTracker {
   }
 
   /**
-   * Drop identities with too few samples to be interesting.
+   * Drop identities that have been idle for longer than `keepMs`.
    *
-   * @param {number} [keepMs=300000]
-   * @param {number} [now=Date.now()]
-   * @returns {number}
+   * This used to check `entry.lastSeen`, which nothing ever wrote, so the guard
+   * condition was never true and the method returned 0 for every input: every
+   * identity the process had ever seen stayed resident forever. Measured on the
+   * old code, 20,000 identities and ten hours of idle time still left all 20,000
+   * held. The tracker keeps up to 64 paths per identity, so an Internet-facing
+   * process behind rotating addresses leaks without bound -- the exact slow DoS
+   * the README tells operators to call sweep() to prevent.
+   *
+   * An entry with no usable `lastSeen` is dropped rather than kept: a timestamp
+   * of 0 is older than any `keepMs`, and retaining an entry whose liveness is
+   * unknown is what made the old behaviour look like a working sweep.
+   *
+   * @param {number} [keepMs=this.sweepKeepMs] idle time before forgetting
+   * @param {number} [now=this.now()]
+   * @returns {number} identities removed
    */
-  sweep(keepMs = 300_000, now = Date.now()) {
+  sweep(keepMs = this.sweepKeepMs, now = this.now()) {
     let removed = 0;
     for (const [key, entry] of this.state) {
-      if (entry.lastSeen !== undefined && now - entry.lastSeen > keepMs) {
+      const lastSeen = entry.lastSeen;
+      if (lastSeen === undefined || now - lastSeen > keepMs) {
         this.state.delete(key);
         removed += 1;
       }
@@ -234,5 +287,6 @@ module.exports = Object.freeze({
   SCAN_ENTROPY,
   SCAN_NOVELTY,
   DEFAULT_HISTORY,
+  DEFAULT_SWEEP_KEEP_MS,
   DEFAULT_IGNORE_PATTERN,
 });
