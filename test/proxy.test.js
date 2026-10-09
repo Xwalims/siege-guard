@@ -327,6 +327,121 @@ test('a single-address header with a forged prefix is not trusted', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Ordering: the chain is validated BEFORE a single-address header is read
+//
+// SINGLE_ADDRESS_ORDER. The regression that made this worth testing:
+//
+//   SINGLE_HEADERS were consulted first, returning on the first header
+//   present. So a client that forges BOTH headers got its forged value
+//   believed, even though the X-Forwarded-For chain right next to it
+//   resolved correctly:
+//
+//     socket 10.0.0.1 (a trusted proxy), appending proxy, real client
+//     203.0.113.9
+//     X-Forwarded-For: 6.6.6.6, 203.0.113.9   -> walk correctly says
+//                                                203.0.113.9, forgery
+//                                                discarded
+//     X-Real-IP: 6.6.6.6                      -> consulted first, so
+//                                                6.6.6.6 won
+//
+// The chain walk is the only mechanism in this file that can tell a forged
+// entry from a real one, and it was being overridden by a header that cannot.
+// Measured against the guard at limit 10, 200 requests each forging a
+// different claimed address: 1 allowed and 99 throttled with the chain alone,
+// 200 allowed and 0 throttled once a forged X-Real-IP was added alongside it.
+// ---------------------------------------------------------------------------
+
+test('SINGLE_ADDRESS_ORDER: a forged single-address header cannot override the chain', () => {
+  const r = createAddressResolver({ trustedProxies: ['10.0.0.0/8'], trustLoopback: false });
+  // The proxy appended the real client, so the leftmost entry is the forgery.
+  const headers = { 'x-forwarded-for': '6.6.6.6, 203.0.113.9' };
+
+  const alone = r.resolve(req('10.0.0.1', headers));
+  assert.equal(alone.address, '203.0.113.9', 'the walk discards the forged entry');
+  assert.equal(alone.source, 'x-forwarded-for');
+
+  // Every single-address header must not change that answer.
+  for (const header of ['x-real-ip', 'cf-connecting-ip', 'true-client-ip', 'fly-client-ip']) {
+    const result = r.resolve(req('10.0.0.1', { ...headers, [header]: '6.6.6.6' }));
+    assert.equal(
+      result.address,
+      '203.0.113.9',
+      `a forged ${header} must not override the validated chain`,
+    );
+    assert.equal(result.source, 'x-forwarded-for');
+    assert.equal(result.untrustedPrefix, true);
+  }
+});
+
+test('SINGLE_ADDRESS_ORDER: rotating a forged single-address header cannot dodge the budget', () => {
+  // The exploit, end to end through the guard rather than the resolver, because
+  // a resolver-level assertion would still pass if some other layer derived
+  // identity from the wrong field.
+  const { SiegeGuard } = require('../src/index.js');
+  const guard = new SiegeGuard({
+    limit: 10,
+    windowMs: 60_000,
+    ipv4Prefix: 32,
+    strikesToBlock: 100,
+    behindProxy: true,
+    trustedProxies: ['10.0.0.0/8'],
+    now: () => 1_000_000,
+  });
+
+  const actions = [];
+  for (let i = 0; i < 200; i += 1) {
+    const forged = `6.${(i >> 16) % 256}.${(i >> 8) % 256}.${i % 256}`;
+    actions.push(
+      guard.check({
+        url: `/x/${i}`,
+        method: 'GET',
+        headers: { 'x-forwarded-for': `${forged}, 203.0.113.9`, 'x-real-ip': forged },
+        socket: { remoteAddress: '10.0.0.1' },
+      }).action,
+    );
+  }
+
+  const throttled = actions.filter((a) => a === 'throttle').length;
+  assert.ok(throttled > 0, 'rotating a forged identity must not produce a fresh budget');
+  assert.equal(guard.window.keys.size, 1, 'every request shares the real client identity');
+});
+
+test('SINGLE_ADDRESS_ORDER: a single-address header is still read when there is no chain', () => {
+  // The fix must not turn these headers off. With no X-Forwarded-For at all
+  // there is nothing to validate against, and the header is the only claim the
+  // proxy makes about the client.
+  const r = oneProxy();
+  const result = r.resolve(req('127.0.0.1', { 'cf-connecting-ip': '203.0.113.7' }));
+  assert.equal(result.address, '203.0.113.7');
+  assert.equal(result.source, 'cf-connecting-ip');
+});
+
+test('SINGLE_ADDRESS_ORDER: a chain present but untrusted outranks a single header too', () => {
+  // The socket is not a proxy, so neither the chain nor the single-address
+  // header may be believed.
+  const r = oneProxy();
+  const result = r.resolve(
+    req('198.51.100.5', { 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '5.6.7.8' })
+  );
+  assert.equal(result.address, '198.51.100.5');
+  assert.equal(result.source, 'socket');
+  assert.match(result.reason, /not a trusted proxy/);
+});
+
+test('SINGLE_ADDRESS_ORDER: an over-long chain is still refused, not fallen through', () => {
+  // The maxHops refusal must not become a route to the single-address headers:
+  // an attacker would send a 200-hop chain to force the fallback and then put
+  // the forgery in X-Real-IP.
+  const long = Array.from({ length: 200 }, (_, i) => `10.0.0.${(i % 250) + 1}`).join(', ');
+  const r = oneProxy({ maxHops: 16 });
+  const result = r.resolve(
+    req('127.0.0.1', { 'x-forwarded-for': long, 'x-real-ip': '6.6.6.6' })
+  );
+  assert.equal(result.address, null, 'an unbounded chain must not become a lookup table');
+  assert.match(result.reason, /exceeds maxHops/);
+});
+
+// ---------------------------------------------------------------------------
 // Malformed input
 // ---------------------------------------------------------------------------
 

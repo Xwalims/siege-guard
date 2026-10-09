@@ -183,64 +183,89 @@ function createAddressResolver(options = {}) {
 
     // A single-address header is only honoured when the socket itself is a
     // trusted proxy, otherwise it is just a stranger asserting who they are.
-    for (const header of SINGLE_HEADERS) {
-      const value = headers[header];
-      if (!value || !isTrusted(socketAddress)) continue;
-      const candidate = String(value).split(',')[0].trim();
-      if (candidate) {
-        return {
-          address: candidate,
-          trusted: true,
-          chain: [socketAddress],
-          source: header,
-          untrustedPrefix: false,
-        };
+    //
+    // It is consulted only when there is no chain to validate, and never
+    // BEFORE the chain walk. That ordering is the security property, not a
+    // detail: the walk below discards forged leading entries by counting
+    // trusted hops backwards, while a single-address header is one
+    // unverifiable value that a client can write itself. Consulting it first
+    // meant the resolver threw away an answer it had already computed
+    // correctly and substituted the forgery --
+    //
+    //   socket 10.0.0.1 (trusted proxy), guard limit 10
+    //   X-Forwarded-For: 6.6.6.6, 203.0.113.9   walk resolves 203.0.113.9
+    //   X-Real-IP: 6.6.6.6                      short-circuits to 6.6.6.6
+    //
+    // so the same forged value that the chain form discards is believed here,
+    // and rotating it gives a fresh budget per request. See SINGLE_ADDRESS_ORDER
+    // in test/proxy.test.js.
+    function singleAddressClaim() {
+      for (const header of SINGLE_HEADERS) {
+        const value = headers[header];
+        if (!value || !isTrusted(socketAddress)) continue;
+        const candidate = String(value).split(',')[0].trim();
+        if (candidate) {
+          return {
+            address: candidate,
+            trusted: true,
+            chain: [socketAddress],
+            source: header,
+            untrustedPrefix: false,
+          };
+        }
       }
+      return null;
     }
 
     // The chain, right to left.
     const raw = headers['x-forwarded-for'];
     const claims = raw ? String(raw).split(',').map((s) => s.trim()).filter(Boolean) : [];
 
-    if (claims.length === 0) {
-      return {
-        address: socketAddress,
-        trusted: true,
-        chain: [],
-        source: 'socket',
-        untrustedPrefix: false,
-      };
-    }
+    if (claims.length > 0) {
+      if (claims.length > maxHops) {
+        return {
+          address: null,
+          trusted: false,
+          chain: claims,
+          source: 'x-forwarded-for',
+          untrustedPrefix: true,
+          reason: `chain of ${claims.length} exceeds maxHops ${maxHops}`,
+        };
+      }
 
-    if (claims.length > maxHops) {
-      return {
-        address: null,
-        trusted: false,
-        chain: claims,
-        source: 'x-forwarded-for',
-        untrustedPrefix: true,
-        reason: `chain of ${claims.length} exceeds maxHops ${maxHops}`,
-      };
-    }
+      // Walk backwards. The first address that is NOT a trusted proxy is the
+      // client: everything to its left was appended by something that does not
+      // get to speak for the client.
+      let current = socketAddress;
+      let resolved = null;
+      let index = claims.length - 1;
+      const walked = [];
+      while (index >= 0) {
+        const candidate = claims[index];
+        if (!isTrusted(current)) break;
+        walked.push(current);
+        resolved = candidate;
+        current = candidate;
+        index -= 1;
+      }
 
-    // Walk backwards. The first address that is NOT a trusted proxy is the
-    // client: everything to its left was appended by something that does not
-    // get to speak for the client.
-    let current = socketAddress;
-    let resolved = null;
-    let index = claims.length - 1;
-    const walked = [];
-    while (index >= 0) {
-      const candidate = claims[index];
-      if (!isTrusted(current)) break;
-      walked.push(current);
-      resolved = candidate;
-      current = candidate;
-      index -= 1;
-    }
-
-    if (resolved === null) {
-      // The socket is not a trusted proxy, so no claim may be believed.
+      if (resolved !== null) {
+        // Whatever remains to the left of the client was never vouched for.
+        const untrustedPrefix = index >= 0;
+        return {
+          address: resolved,
+          trusted: !untrustedPrefix,
+          chain: walked,
+          source: 'x-forwarded-for',
+          untrustedPrefix,
+          reason: untrustedPrefix
+            ? `discarded ${index + 1} untrusted leading entr(y/ies) from the forwarding chain`
+            : undefined,
+        };
+      }
+      // The socket is not a trusted proxy, so no claim may be believed --
+      // including the single-address headers, which the socket is equally
+      // not entitled to set.
       return {
         address: socketAddress,
         trusted: true,
@@ -251,18 +276,15 @@ function createAddressResolver(options = {}) {
       };
     }
 
-    // Whatever remains to the left of the client was never vouched for.
-    const untrustedPrefix = index >= 0;
+    const single = singleAddressClaim();
+    if (single) return single;
 
     return {
-      address: resolved,
-      trusted: !untrustedPrefix,
-      chain: walked,
-      source: 'x-forwarded-for',
-      untrustedPrefix,
-      reason: untrustedPrefix
-        ? `discarded ${index + 1} untrusted leading entr(y/ies) from the forwarding chain`
-        : undefined,
+      address: socketAddress,
+      trusted: true,
+      chain: [],
+      source: 'socket',
+      untrustedPrefix: false,
     };
   }
 

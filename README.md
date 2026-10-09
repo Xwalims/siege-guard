@@ -406,6 +406,33 @@ no trustedProxies configured + XFF: 1.2.3.4  -> the socket   headers ignored
 200 hops, maxHops 16                         -> null          refused, not parsed
 ```
 
+### The chain is validated first, not last
+
+`X-Real-IP`, `CF-Connecting-IP`, `True-Client-IP` and `Fly-Client-IP` carry a single
+address rather than a chain. They are read only when there is **no** `X-Forwarded-For`
+to validate. A client that sends both headers gets the chain's answer, because the chain
+is the only form that can distinguish a forged entry from a real one.
+
+That ordering is the whole point, and it was backwards:
+
+```
+socket 10.0.0.1 (a trusted proxy), appending proxy, real client 203.0.113.9
+
+X-Forwarded-For: 6.6.6.6, 203.0.113.9   walk correctly resolves 203.0.113.9
+X-Real-IP: 6.6.6.6                      consulted first, so 6.6.6.6 won
+```
+
+The resolver computed the right answer and then discarded it. Against a guard with
+`limit: 10`, 200 requests each forging a different claimed address: **1 allowed, 99
+throttled** with the chain alone, **200 allowed, 0 throttled** once a forged `X-Real-IP`
+was added beside it. Rotation through unbounded identities defeats a per-identity budget
+completely, so the forged value was being handed straight to `identityOf()`.
+
+The limitation that remains, and is deliberate: when a client sends a single-address
+header and **no** `X-Forwarded-For` at all, that header is trusted, because there is
+nothing to validate it against. Set `trustedProxies` to the proxy ranges that actually
+*overwrite* these headers, or configure the proxy to always send `X-Forwarded-For`.
+
 An empty `trustedProxies` is the safe default: forwarding headers are ignored and every
 client is the socket address. Loopback is trusted automatically, because a local proxy is the
 ordinary case; set `trustLoopback: false` to require an explicit list.
